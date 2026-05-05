@@ -3,3 +3,4 @@ Scenarios/
 BeMamba.pdf
 checkpoints/
 major/
+__pycache__/
