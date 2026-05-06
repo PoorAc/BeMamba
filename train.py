@@ -12,6 +12,7 @@ import json
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+import argparse
 from tqdm import tqdm
 from datetime import datetime
 import matplotlib.pyplot as plt
@@ -19,6 +20,7 @@ import matplotlib.pyplot as plt
 from config import (
     CSV_FILE, NUM_BEAMS, D_MODEL, D_STATE, D_CONV, EXPAND, NUM_LAYERS,
     BATCH_SIZE, EPOCHS, LR, WEIGHT_DECAY, TOP_K, CHECKPOINT_DIR,
+    MODALITY_DROPOUT, SCHEDULER_T0, SCHEDULER_T_MULT,
     DEVICE, DATASET_ROOT,
 )
 from dataset import build_datasets
@@ -155,6 +157,13 @@ def train_epoch(model, loader, optimizer, criterion):
         batch  = to_device(batch)
         labels = batch["label"]
 
+        # Random modality dropout for better generalization across gaps.
+        if MODALITY_DROPOUT > 0 and len(model.active) > 1:
+            if torch.rand(1).item() < MODALITY_DROPOUT:
+                drop_mod = model.active[torch.randint(len(model.active), (1,)).item()]
+                if drop_mod in batch:
+                    batch[drop_mod] = torch.zeros_like(batch[drop_mod])
+
         optimizer.zero_grad()
         logits = model(batch)
         loss   = criterion(logits, labels)
@@ -194,13 +203,20 @@ def evaluate(model, loader) -> dict:
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate a saved BeMamba model on a dataset split.")
+    parser.add_argument("--run_name", required=True, help="Name of the training run")
+    return parser.parse_args()
+
 def main():
     print(f"Device: {DEVICE}\n")
+    
+    args = parse_args()  # For compatibility with cross_infer.py; not used in this script
 
     # ── Setup run metadata ─────────────────────────────────────────────────
     scenario_name = os.path.basename(DATASET_ROOT)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_id = f"{scenario_name}_{timestamp}"
+    run_id = args.run_name if args.run_name else f"{scenario_name}_{timestamp}"
 
     # Create run-specific directories
     run_dir = os.path.join(CHECKPOINT_DIR, run_id)
@@ -217,6 +233,10 @@ def main():
             "epochs": EPOCHS,
             "lr": LR,
             "weight_decay": WEIGHT_DECAY,
+            "modality_dropout": MODALITY_DROPOUT,
+            "scheduler": "CosineAnnealingWarmRestarts",
+            "scheduler_t0": SCHEDULER_T0,
+            "scheduler_t_mult": SCHEDULER_T_MULT,
             "d_model": D_MODEL,
             "d_state": D_STATE,
             "d_conv": D_CONV,
@@ -258,7 +278,8 @@ def main():
     # ── Optimiser & schedule ──────────────────────────────────────────────
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR,
                                    weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=SCHEDULER_T0, T_mult=SCHEDULER_T_MULT)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)

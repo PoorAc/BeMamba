@@ -4,3 +4,4 @@ BeMamba.pdf
 checkpoints/
 major/
 __pycache__/
+cross_inference/
