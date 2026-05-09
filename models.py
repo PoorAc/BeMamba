@@ -30,6 +30,39 @@ from config import (
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 0.  ADAPTER MODULE  (for domain adaptation)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AdapterModule(nn.Module):
+    """
+    Lightweight adapter layer for domain adaptation.
+    Inserted between shared feature extractor and task-specific head.
+    
+    Architecture:
+      x  →  LayerNorm  →  Down-projection  →  SiLU  →  Up-projection  +  Residual
+    
+    The bottleneck design (d_model → d_adapter → d_model) learns domain-specific
+    transformations while keeping most parameters in the frozen base model.
+    """
+    
+    def __init__(self, d_model: int, d_adapter: int = 64):
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.down = nn.Linear(d_model, d_adapter)
+        self.up = nn.Linear(d_adapter, d_model)
+        self.activation = nn.SiLU()
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, d_model)  →  (B, d_model)"""
+        residual = x
+        x = self.norm(x)
+        x = self.down(x)
+        x = self.activation(x)
+        x = self.up(x)
+        return x + residual
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 1.  MAMBA BLOCK  (Selective State Space Model)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -383,6 +416,9 @@ class BeMamba(nn.Module):
         # ── Cross-modal fusion ────────────────────────────────────────────
         self.msm = ModalSequenceMamba(d_model, d_state, d_conv, expand, num_layers)
 
+        # ── Domain-specific adapter layer (for cross-domain adaptation) ────
+        self.adapter = AdapterModule(d_model, d_adapter=64)
+
         # ── Beam classifier ───────────────────────────────────────────────
         self.classifier = nn.Sequential(
             nn.Linear(d_model, d_model),
@@ -449,4 +485,5 @@ class BeMamba(nn.Module):
             raise RuntimeError("No modality data found in batch.")
 
         fused  = self.msm(modal_feats)
-        return self.classifier(fused)
+        adapted = self.adapter(fused)
+        return self.classifier(adapted)

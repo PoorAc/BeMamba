@@ -204,8 +204,8 @@ def evaluate(model, loader) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate a saved BeMamba model on a dataset split.")
-    parser.add_argument("--run_name", required=True, help="Name of the training run")
+    parser = argparse.ArgumentParser(description="Train a new BeMamba model on a dataset scenario.")
+    parser.add_argument("--run-name", help="Name of the training run", default=None)
     return parser.parse_args()
 
 def main():

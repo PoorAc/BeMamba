@@ -12,7 +12,7 @@ import torch
 # Root of the extracted DeepSense 6G scenario folder.
 # Download any scenario from: https://www.deepsense6g.net
 # Recommended: Scenario8 or Scenario9 for multi-modal data
-SCENARIO = 31
+SCENARIO = 32
 DATASET_ROOT = "./Scenarios/" + str(SCENARIO)
 
 # CSV file with beam labels, GPS readings, and file-path columns.
