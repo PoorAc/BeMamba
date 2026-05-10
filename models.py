@@ -30,6 +30,43 @@ from config import (
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 0.  ADAPTER MODULE  (for domain adaptation)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AdapterModule(nn.Module):
+    """
+    Lightweight adapter layer for domain adaptation.
+    Inserted between shared feature extractor and task-specific head.
+    
+    Architecture:
+      x  →  LayerNorm  →  Down-projection  →  SiLU  →  Up-projection  +  Residual
+    
+    The bottleneck design (d_model → d_adapter → d_model) learns domain-specific
+    transformations while keeping most parameters in the frozen base model.
+    """
+    
+    def __init__(self, d_model: int, d_adapter: int = 64):
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.down = nn.Linear(d_model, d_adapter)
+        self.up = nn.Linear(d_adapter, d_model)
+        self.activation = nn.SiLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_shape = x.shape
+        x = x.view(-1, orig_shape[-1])
+
+        residual = x
+        x = self.norm(x)
+        x = self.down(x)
+        x = self.activation(x)
+        x = self.up(x)
+
+        x = x + residual
+        return x.view(*orig_shape)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 1.  MAMBA BLOCK  (Selective State Space Model)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -64,7 +101,6 @@ class MambaBlock(nn.Module):
         self.x_proj  = nn.Linear(self.d_inner, d_state * 2 + 1, bias=False)
         self.dt_proj = nn.Linear(1, self.d_inner, bias=True)
 
-        # Fixed A (log-parameterised so it stays negative after exp)
         A = torch.arange(1, d_state + 1, dtype=torch.float32) \
                   .unsqueeze(0).expand(self.d_inner, -1)
         self.A_log = nn.Parameter(torch.log(A))
@@ -78,42 +114,38 @@ class MambaBlock(nn.Module):
         residual = x
         x = self.norm(x)
 
-        # ── Project and split ──────────────────────────────────────────────
-        xz           = self.in_proj(x)                    # (B, L, 2·d_inner)
-        x_ssm, gate  = xz.chunk(2, dim=-1)               # each (B, L, d_inner)
+        xz           = self.in_proj(x)
+        x_ssm, gate  = xz.chunk(2, dim=-1)
 
-        # ── Causal local conv ─────────────────────────────────────────────
-        x_ssm = x_ssm.transpose(1, 2)                    # (B, d_inner, L)
-        x_ssm = self.conv1d(x_ssm)[..., :L]              # trim right padding
-        x_ssm = x_ssm.transpose(1, 2)                    # (B, L, d_inner)
+        x_ssm = x_ssm.transpose(1, 2)
+        x_ssm = self.conv1d(x_ssm)[..., :L]
+        x_ssm = x_ssm.transpose(1, 2)
         x_ssm = F.silu(x_ssm)
 
-        # ── Selective parameters ──────────────────────────────────────────
-        params  = self.x_proj(x_ssm)                     # (B, L, 2·d_state+1)
-        B_p     = params[..., :self.d_state]              # input-dep B
-        C_p     = params[..., self.d_state:2*self.d_state]# input-dep C
-        dt      = F.softplus(self.dt_proj(params[..., -1:])) # (B, L, d_inner)
+        params  = self.x_proj(x_ssm)
+        B_p     = params[..., :self.d_state]
+        C_p     = params[..., self.d_state:2*self.d_state]
+        dt      = F.softplus(self.dt_proj(params[..., -1:]))
 
-        A = -torch.exp(self.A_log)                        # (d_inner, d_state)
+        A = -torch.exp(self.A_log)
 
-        # ── ZOH discretisation ────────────────────────────────────────────
-        dA = torch.exp(dt.unsqueeze(-1) * A)              # (B, L, d_inner, d_state)
-        dB = dt.unsqueeze(-1) * B_p.unsqueeze(2)          # (B, L, d_inner, d_state)
+        dA = torch.exp(dt.unsqueeze(-1) * A)
+        dB = dt.unsqueeze(-1) * B_p.unsqueeze(2)
 
-        # ── Sequential SSM scan ───────────────────────────────────────────
         h  = torch.zeros(B, self.d_inner, self.d_state, device=x.device)
         ys = []
         for t in range(L):
             h     = dA[:, t] * h + dB[:, t] * x_ssm[:, t].unsqueeze(-1)
-            y_t   = (h * C_p[:, t].unsqueeze(1)).sum(-1)  # (B, d_inner)
+            y_t   = (h * C_p[:, t].unsqueeze(1)).sum(-1)
             ys.append(y_t)
 
-        y   = torch.stack(ys, dim=1)                      # (B, L, d_inner)
-        y   = y + x_ssm * self.D                          # D skip
+        y   = torch.stack(ys, dim=1)
+        y   = y + x_ssm * self.D
 
         # ── Gating + output proj ──────────────────────────────────────────
         out = y * F.silu(gate)
         return self.out_proj(out) + residual
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -139,7 +171,7 @@ class TimeSequenceMamba(nn.Module):
         """x: (B, T, d_model)  →  (B, d_model)"""
         for layer in self.layers:
             x = layer(x)
-        return x[:, -1]   # last timestep = temporally fused feature
+        return x[:, -1]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -350,38 +382,43 @@ class BeMamba(nn.Module):
         self,
         modalities: dict,          # e.g. {"image": True, "gps": True, "lidar": False, "radar": True}
         d_model:    int = D_MODEL,
-        d_state:    int = D_STATE,
-        d_conv:     int = D_CONV,
-        expand:     int = EXPAND,
-        num_layers: int = NUM_LAYERS,
         num_beams:  int = NUM_BEAMS,
+        use_adapters: bool = False,     # whether to include the domain-adaptation adapter layer
     ):
         super().__init__()
         self.modalities = modalities
         self.active     = [k for k, v in modalities.items() if v]
-
+        self.use_adapters = use_adapters
+        
         if not self.active:
             raise ValueError("BeMamba needs at least one active modality.")
 
         # ── Extractors ────────────────────────────────────────────────────
         if modalities.get("image"):
             self.image_ext = ImageExtractor(d_model)
-            self.image_tsm = TimeSequenceMamba(d_model, d_state, d_conv, expand, num_layers)
+            self.image_tsm = TimeSequenceMamba(d_model)
+            self.image_adapter = AdapterModule(d_model)
 
         if modalities.get("gps"):
             self.gps_ext = GPSExtractor(d_model)
-            self.gps_tsm = TimeSequenceMamba(d_model, d_state, d_conv, expand, num_layers)
+            self.gps_tsm = TimeSequenceMamba(d_model)
+            self.gps_adapter = AdapterModule(d_model)
 
         if modalities.get("lidar"):
             self.lidar_ext = LiDARExtractor(d_model)
-            self.lidar_tsm = TimeSequenceMamba(d_model, d_state, d_conv, expand, num_layers)
+            self.lidar_tsm = TimeSequenceMamba(d_model)
+            self.lidar_adapter = AdapterModule(d_model)
 
         if modalities.get("radar"):
             self.radar_ext = RadarExtractor(d_model)
-            self.radar_tsm = TimeSequenceMamba(d_model, d_state, d_conv, expand, num_layers)
+            self.radar_tsm = TimeSequenceMamba(d_model)
+            self.radar_adapter = AdapterModule(d_model)
 
         # ── Cross-modal fusion ────────────────────────────────────────────
-        self.msm = ModalSequenceMamba(d_model, d_state, d_conv, expand, num_layers)
+        self.msm = ModalSequenceMamba(d_model)
+
+        # ── Domain-specific adapter layer (for cross-domain adaptation) ────
+        self.adapter = AdapterModule(d_model)
 
         # ── Beam classifier ───────────────────────────────────────────────
         self.classifier = nn.Sequential(
@@ -409,7 +446,7 @@ class BeMamba(nn.Module):
         return tsm(feats)                          # (B, d_model)
 
     # ── Forward ───────────────────────────────────────────────────────────
-    def forward(self, batch: dict) -> torch.Tensor:
+    def forward_features(self, batch: dict) -> torch.Tensor:
         """
         batch : dict produced by DeepSense6GDataset.__getitem__
                 Keys present depend on which modalities were detected.
@@ -422,31 +459,50 @@ class BeMamba(nn.Module):
             B, T, C, H, W = batch["images"].shape
             flat  = batch["images"].view(B * T, C, H, W)
             feats = self.image_ext(flat).view(B, T, -1)
-            modal_feats.append(self.image_tsm(feats))
+            feat = self.image_tsm(feats)
+            if self.use_adapters:
+                feat = self.image_adapter(feat)
+            modal_feats.append(feat)
 
         if self.modalities.get("gps") and "gps" in batch:
             # gps: (B, T, 2)
-            modal_feats.append(
-                self._extract_sequence(self.gps_ext, self.gps_tsm,
-                                       batch["gps"], is_1d=True)
-            )
+            feat = self._extract_sequence(self.gps_ext, self.gps_tsm,
+                                          batch["gps"], True)
+            if self.use_adapters:
+                feat = self.gps_adapter(feat)
+            modal_feats.append(feat)
 
         if self.modalities.get("lidar") and "lidar" in batch:
             # lidar: (B, T, D, H, W)
             B, T, D, H, W = batch["lidar"].shape
             flat  = batch["lidar"].view(B * T, D, H, W)
             feats = self.lidar_ext(flat).view(B, T, -1)
-            modal_feats.append(self.lidar_tsm(feats))
+            feat = self.lidar_tsm(feats)
+            if self.use_adapters:
+                feat = self.lidar_adapter(feat)
+            modal_feats.append(feat)
 
         if self.modalities.get("radar") and "radar" in batch:
             # radar: (B, T, 1, H, W)
             B, T, _, H, W = batch["radar"].shape
             flat  = batch["radar"].view(B * T, 1, H, W)
             feats = self.radar_ext(flat).view(B, T, -1)
-            modal_feats.append(self.radar_tsm(feats))
+            feat = self.radar_tsm(feats)
+            if self.use_adapters:
+                feat = self.radar_adapter(feat)
+            modal_feats.append(feat)
 
         if not modal_feats:
             raise RuntimeError("No modality data found in batch.")
 
         fused  = self.msm(modal_feats)
+        
+        return fused
+    
+    def forward(self, batch: dict) -> torch.Tensor:
+        fused = self.forward_features(batch)
+        
+        if self.use_adapters:
+            fused = self.adapter(fused)
+        
         return self.classifier(fused)
