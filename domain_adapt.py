@@ -113,108 +113,87 @@ def print_trainable_params(model: BeMamba):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ElasticWeightConsolidation:
-    """Elastic Weight Consolidation to prevent catastrophic forgetting.
-    
-    Computes Fisher Information Matrix on source task and penalizes
-    changes to important weights during fine-tuning on target task.
-    """
-    
     def __init__(self, model: nn.Module, device: str, fisher_lambda: float = 0.4):
-        """
-        Args:
-            model: Neural network model
-            device: Device (cuda/cpu)
-            fisher_lambda: EWC regularization strength (default 0.4)
-        """
         self.device = device
         self.fisher_lambda = fisher_lambda
-        
-        # Store optimal parameters from source model
+
+        # Store source optimal params BEFORE any adaptation
         self.optimal_params = {
             name: param.data.clone().detach()
             for name, param in model.named_parameters()
         }
-        
-        # Fisher Information Matrix (will be computed)
+
         self.fisher_matrix = {}
-        
-    def compute_fisher_information(self, model: nn.Module, loader: DataLoader, 
-                                   criterion: nn.Module, num_batches: int = None):
-        """Compute Fisher Information Matrix on source domain.
-        
-        Args:
-            model: Source model
-            loader: Data loader (typically validation/test set of source domain)
-            criterion: Loss function
-            num_batches: Number of batches to use (None = all)
-        """
+
+    def compute_fisher_information(self, model, loader, num_batches=None):
         print("\n[EWC] Computing Fisher Information Matrix...")
-        
+
         model.eval()
-        fisher = {name: torch.zeros_like(param) 
-                  for name, param in model.named_parameters()}
-        
-        num_processed = 0
+
+        fisher = {
+            name: torch.zeros_like(param)
+            for name, param in model.named_parameters()
+        }
+
+        total_samples = 0
+
         for batch_idx, batch in enumerate(tqdm(loader, desc="  fisher", leave=False)):
             if num_batches and batch_idx >= num_batches:
                 break
-            
-            # Move batch to device
-            if isinstance(batch, dict):
-                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                        for k, v in batch.items()}
-            else:
-                batch = batch.to(self.device)
-            
-            labels = batch["label"] if isinstance(batch, dict) else batch[1]
-            
-            # Forward pass
+
+            batch = {
+                k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            }
+
+            labels = batch["label"]
+            batch_size = labels.size(0)
+
             model.zero_grad()
             logits = model(batch)
-            loss = criterion(logits, labels)
-            
-            # Backward pass to get gradients
+
+            # ✅ Correct log-likelihood based loss
+            log_probs = torch.log_softmax(logits, dim=1)
+            loss = log_probs.gather(1, labels.unsqueeze(1)).mean()
+
             loss.backward()
-            
-            # Accumulate squared gradients (Fisher Information Matrix)
+
             for name, param in model.named_parameters():
                 if param.grad is not None:
-                    fisher[name] += param.grad.data ** 2
-            
-            num_processed += 1
-        
-        # Average over batches
+                    fisher[name] += (param.grad.data ** 2) * batch_size
+
+            total_samples += batch_size
+
+        # Normalize properly
         for name in fisher:
-            fisher[name] /= num_processed
-            fisher[name] = fisher[name].clamp(min=1e-6)  # Clamp to prevent division by zero
-        
+            fisher[name] /= max(total_samples, 1)
+            fisher[name] = fisher[name].clamp(min=1e-6)
+
         self.fisher_matrix = fisher
-        print(f"[EWC] Fisher Information computed from {num_processed} batches")
-    
-    def ewc_penalty(self, model: nn.Module) -> torch.Tensor:
-        """Compute EWC penalty term.
-        
-        Penalty = (lambda/2) * sum_i F_i * (theta_i - theta*_i)^2
-        
-        where F_i is Fisher Information, theta_i are current params, theta*_i are optimal (source) params
-        """
+        print(f"[EWC] Fisher computed over {total_samples} samples")
+
+    def ewc_penalty(self, model):
         penalty = torch.tensor(0.0, device=self.device)
-        
+
         for name, param in model.named_parameters():
-            if name in self.fisher_matrix:
-                fisher = self.fisher_matrix[name]
-                optimal = self.optimal_params[name]
-                penalty += (fisher * (param - optimal) ** 2).sum()
-        
-        return (self.fisher_lambda / 2) * penalty
-    
-    def get_config(self) -> dict:
-        """Return EWC configuration for logging."""
+            if not param.requires_grad:
+                continue
+            if name not in self.fisher_matrix:
+                continue
+            if "classifier" in name:
+                continue  # avoid over-regularizing classifier
+
+            fisher = self.fisher_matrix[name]
+            optimal = self.optimal_params[name]
+
+            penalty += (fisher * (param - optimal) ** 2).sum()
+
+        return penalty
+
+    def get_config(self):
         return {
             "fisher_lambda": self.fisher_lambda,
-            "num_fisher_params": sum(
-                f.numel() for f in self.fisher_matrix.values()
-            ) if self.fisher_matrix else 0,
+            "num_fisher_params": sum(f.numel() for f in self.fisher_matrix.values())
         }
 
 
@@ -273,8 +252,7 @@ def topk_accuracy(logits: torch.Tensor, labels: torch.Tensor, k: int) -> float:
     return correct.any(dim=1).float().mean().item()
 
 
-def train_epoch(model, loader, optimizer, criterion, device, ewc: ElasticWeightConsolidation = None):
-    """Run one training epoch with optional EWC penalty."""
+def train_epoch(model, loader, optimizer, criterion, device, ewc=None, ewc_lambda=0.0):
     model.train()
     total_loss = total_acc = 0.0
 
@@ -285,12 +263,10 @@ def train_epoch(model, loader, optimizer, criterion, device, ewc: ElasticWeightC
         optimizer.zero_grad()
         logits = model(batch)
         loss = criterion(logits, labels)
-        
-        # Add EWC penalty if enabled
+
         if ewc is not None:
-            ewc_loss = ewc.ewc_penalty(model)
-            loss = loss + ewc_loss
-        
+            loss = loss + ewc_lambda * ewc.ewc_penalty(model)
+
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
@@ -327,6 +303,8 @@ def plot_adaptation_metrics(history: dict, save_path: str):
     train_top1 = [e['train_top1'] for e in history['epochs']]
     val_top1 = [e['val_top1'] for e in history['epochs']]
     val_top3 = [e['val_top3'] for e in history['epochs']]
+    src_top1 = [e['src_top1'] for e in history['epochs']]
+    src_top3 = [e['src_top3'] for e in history['epochs']]
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
     fig.suptitle(f"Domain Adaptation: {history['source_scenario']} → {history['target_scenario']}", fontsize=12)
@@ -341,6 +319,8 @@ def plot_adaptation_metrics(history: dict, save_path: str):
     ax2.plot(epochs, train_top1, 'g-', linewidth=2, label='Train Top-1')
     ax2.plot(epochs, val_top1, 'g--', linewidth=2, label='Val Top-1')
     ax2.plot(epochs, val_top3, 'orange', linewidth=2, label='Val Top-3')
+    ax2.plot(epochs, src_top1, 'purple', linewidth=2, label='Src Top-1')
+    ax2.plot(epochs, src_top3, 'purple', linestyle='--', linewidth=2, label='Src Top-3')
     ax2.set_xlabel('Epoch')
     ax2.set_ylabel('Accuracy')
     ax2.set_title('Validation Accuracy')
@@ -383,6 +363,17 @@ def main():
     print(f"Loading checkpoint: {args.checkpoint}")
     model, src_metadata = load_source_model(args.checkpoint, device)
     
+    # ── LOAD SOURCE DATA (for Fisher) ────────────────────────────────────
+    src_train, src_val, _, _ = build_datasets(args.source_csv)
+
+    src_loader = DataLoader(
+        src_val,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
+    
     # ── Load target domain data ───────────────────────────────────────────
     print(f"\nLoading target domain: {args.target_csv}")
     train_ds, val_ds, test_ds, tgt_modalities = build_datasets(args.target_csv)
@@ -402,6 +393,27 @@ def main():
                             num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
                              num_workers=4, pin_memory=True)
+    
+    # ── Setup Elastic Weight Consolidation (if enabled) ───────────────────
+    ewc = None
+    if args.use_ewc:
+        print(f"\n[EWC] Initializing (lambda={args.ewc_lambda})")
+
+        ewc = ElasticWeightConsolidation(
+            model,
+            device,
+            fisher_lambda=args.ewc_lambda
+        )
+
+        # Optional caching
+        fisher_path = os.path.join("fisher_cache.pt")
+
+        if os.path.exists(fisher_path):
+            print("[EWC] Loading cached Fisher matrix...")
+            ewc.fisher_matrix = torch.load(fisher_path)
+        else:
+            ewc.compute_fisher_information(model, src_loader)
+            torch.save(ewc.fisher_matrix, fisher_path)
     
     # ── Setup training ────────────────────────────────────────────────────
     print(f"\n[Adaptation Strategy: {args.strategy}]")
@@ -423,14 +435,6 @@ def main():
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-    
-    # ── Setup Elastic Weight Consolidation (if enabled) ───────────────────
-    ewc = None
-    if args.use_ewc:
-        ewc = ElasticWeightConsolidation(model, device, fisher_lambda=args.ewc_lambda)
-        print(f"\n[EWC] Initializing with lambda={args.ewc_lambda}")
-        ewc.compute_fisher_information(model, val_loader, criterion, num_batches=None)
-        print(f"[EWC] Fisher Information Matrix computed and stored")
     
     # ── Initialize history ────────────────────────────────────────────────
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -473,6 +477,7 @@ def main():
         
         train_loss, train_top1 = train_epoch(model, train_loader, optimizer, criterion, device, ewc=ewc)
         val_metrics = evaluate(model, val_loader, device)
+        src_metrics = evaluate(model, src_loader, device)
         scheduler.step()
         
         epoch_data = {
@@ -482,14 +487,20 @@ def main():
             "val_top1": val_metrics["top1"],
             "val_top3": val_metrics["top3"],
             "val_top5": val_metrics["top5"],
+            "src_top1": src_metrics["top1"],
+            "src_top3": src_metrics["top3"],
+            "src_top5": src_metrics["top5"],
             "lr": optimizer.param_groups[0]["lr"]
         }
         history["epochs"].append(epoch_data)
         
         print(
             f"Epoch {epoch:02d}/{args.epochs}  "
-            f"loss={train_loss:.4f}  train_top1={train_top1:.4f}  "
-            f"val_top1={val_metrics['top1']:.4f}  val_top3={val_metrics['top3']:.4f}"
+            f"loss={train_loss:.4f}  "
+            f"train_top1={train_top1:.4f}  "
+            f"val_top1={val_metrics['top1']:.4f}  "
+            f"val_top3={val_metrics['top3']:.4f}  "
+            f"src_top1={src_metrics['top1']:.4f}"
         )
         
         # Save best checkpoint
