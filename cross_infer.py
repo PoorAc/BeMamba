@@ -56,10 +56,6 @@ def load_checkpoint(checkpoint_path: str, device: str):
     model = BeMamba(
         modalities=checkpoint["modalities"],
         d_model=config.D_MODEL,
-        d_state=config.D_STATE,
-        d_conv=config.D_CONV,
-        expand=config.EXPAND,
-        num_layers=config.NUM_LAYERS,
         num_beams=config.NUM_BEAMS,
     ).to(device)
     model.load_state_dict(checkpoint["model_state"])
@@ -100,12 +96,42 @@ def parse_args():
     parser.add_argument("--output", help="Optional path to save JSON results")
     return parser.parse_args()
 
+import json
+import torch
+import numpy as np
+
+def make_json_serializable(obj):
+    """Recursively convert tensors/arrays to JSON-safe Python types."""
+    
+    if isinstance(obj, torch.Tensor):
+        # scalar tensor
+        if obj.numel() == 1:
+            return obj.item()
+        # multi-value tensor
+        return obj.detach().cpu().tolist()
+
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+
+    elif isinstance(obj, np.generic):
+        return obj.item()
+
+    elif isinstance(obj, dict):
+        return {k: make_json_serializable(v) for k, v in obj.items()}
+
+    elif isinstance(obj, list):
+        return [make_json_serializable(v) for v in obj]
+
+    elif isinstance(obj, tuple):
+        return [make_json_serializable(v) for v in obj]
+
+    return obj
 
 def save_results(output_dir: str, summary: dict, split: str):
     os.makedirs(output_dir, exist_ok=True)
     json_path = os.path.join(output_dir, f"{split}_results.json")
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
+        json.dump(make_json_serializable(summary), f, indent=2)
 
     plt.figure(figsize=(6, 4))
     keys = [k for k in summary["results"] if k.startswith("top")]

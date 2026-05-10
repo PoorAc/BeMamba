@@ -190,7 +190,7 @@ def train_epoch(model, loader, optimizer, criterion, scheduler, scaler, epoch):
 
         optimizer.zero_grad()
 
-        with torch.cuda.amp.autocast(enabled=(DEVICE == "cuda")):
+        with torch.amp.autocast("cuda", enabled=(DEVICE == "cuda")):
             logits = model(batch)
             loss   = criterion(logits, labels)
 
@@ -238,7 +238,7 @@ def evaluate(model, loader) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main
+# File utilites
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args():
@@ -246,6 +246,15 @@ def parse_args():
     parser.add_argument("--run-name", help="Name of the training run", default=None)
     parser.add_argument("--patience", type=int, default=10, help="Number of epochs with no improvement to wait before early stopping")
     return parser.parse_args()
+        
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     
@@ -296,13 +305,8 @@ def main():
     training_history["hyperparameters"]["seq_len"] = train_ds.seq_len
     training_history["modalities"] = modalities
 
-    num_workers = min(8, os.cpu_count() or 1)
-    pin_memory = DEVICE == "cuda"
-    
-    def seed_worker(worker_id):
-        worker_seed = torch.initial_seed() % 2**32
-        np.random.seed(worker_seed)
-        random.seed(worker_seed)
+    num_workers = 2
+    pin_memory = False
         
     g = torch.Generator()
     g.manual_seed(SEED)
@@ -313,7 +317,7 @@ def main():
         shuffle=True,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        persistent_workers=(num_workers > 0),
+        persistent_workers=False,
         worker_init_fn=seed_worker,
         generator=g
     )
@@ -324,7 +328,7 @@ def main():
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        persistent_workers=(num_workers > 0),
+        persistent_workers=False,
         worker_init_fn=seed_worker,
         generator=g
     )
@@ -335,7 +339,7 @@ def main():
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        persistent_workers=(num_workers > 0),
+        persistent_workers=False,
         worker_init_fn=seed_worker,
         generator=g
     )
@@ -343,9 +347,9 @@ def main():
     # ── Model ─────────────────────────────────────────────────────────────
     model = BeMamba(
         modalities=modalities,
-        d_model=D_MODEL, d_state=D_STATE, d_conv=D_CONV,
-        expand=EXPAND, num_layers=NUM_LAYERS, num_beams=NUM_BEAMS,
-        use_adapters=False  
+        d_model=D_MODEL,
+        num_beams=NUM_BEAMS,
+        use_adapters=False,
     ).to(DEVICE)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -365,7 +369,7 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=SCHEDULER_T0, T_mult=SCHEDULER_T_MULT)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-    scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE == "cuda"))
+    scaler = torch.amp.GradScaler("cuda", enabled=(DEVICE == "cuda"))
 
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     best_top3 = 0.0

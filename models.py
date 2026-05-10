@@ -383,12 +383,12 @@ class BeMamba(nn.Module):
         modalities: dict,          # e.g. {"image": True, "gps": True, "lidar": False, "radar": True}
         d_model:    int = D_MODEL,
         num_beams:  int = NUM_BEAMS,
-        use_adpaters: bool = False,     # whether to include the domain-adaptation adapter layer
+        use_adapters: bool = False,     # whether to include the domain-adaptation adapter layer
     ):
         super().__init__()
         self.modalities = modalities
         self.active     = [k for k, v in modalities.items() if v]
-        self.use_adapters = use_adpaters
+        self.use_adapters = use_adapters
         
         if not self.active:
             raise ValueError("BeMamba needs at least one active modality.")

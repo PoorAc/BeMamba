@@ -212,11 +212,8 @@ def load_source_model(checkpoint_path: str, device: str) -> tuple:
     model = BeMamba(
         modalities=ckpt["modalities"],
         d_model=config.D_MODEL,
-        d_state=config.D_STATE,
-        d_conv=config.D_CONV,
-        expand=config.EXPAND,
-        num_layers=config.NUM_LAYERS,
         num_beams=config.NUM_BEAMS,
+        use_adapters=True,
     ).to(device)
     
     # Load state dict with strict=False to handle cases where checkpoint doesn't have adapter weights
@@ -353,6 +350,7 @@ def main():
     parser.add_argument("--use-ewc", action="store_true", help="Enable Elastic Weight Consolidation")
     parser.add_argument("--ewc-lambda", type=float, default=0.4, 
                        help="EWC regularization strength (default 0.4)")
+    parser.add_argument("--patience", type=int, default=10, help="Early stopping patience (epochs)")
     
     args = parser.parse_args()
 
@@ -406,7 +404,7 @@ def main():
         )
 
         # Optional caching
-        fisher_path = os.path.join("fisher_cache.pt")
+        fisher_path = os.path.join(models_dir,"fisher_cache.pt")
 
         if os.path.exists(fisher_path):
             print("[EWC] Loading cached Fisher matrix...")
@@ -467,6 +465,9 @@ def main():
     # ── Training loop ─────────────────────────────────────────────────────
     best_val_top3 = 0.0
     
+    patience = args.patience
+    no_improve_epochs = 0
+    
     for epoch in range(1, args.epochs + 1):
         # Progressive unfreezing: unfreeze MSM at halfway point
         if args.strategy == "progressive" and epoch == args.epochs // 2:
@@ -518,6 +519,13 @@ def main():
                 "strategy": args.strategy,
             }, best_ckpt)
             print(f"  ✓ Saved best (top-3={best_val_top3:.4f})")
+        else:
+            no_improve_epochs += 1
+            print(f"  No improvement for {no_improve_epochs} epoch(s)")
+            
+        if no_improve_epochs >= patience:
+            print(f"Early stopping triggered after {patience} epochs without improvement.")
+            break
     
     # ── Test evaluation ───────────────────────────────────────────────────
     print("\nLoading best checkpoint for test evaluation...")
