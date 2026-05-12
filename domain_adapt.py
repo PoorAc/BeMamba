@@ -16,7 +16,8 @@ Usage:
         --epochs 50 \
         --use-ewc \
         --ewc-lambda 1.0 \
-        --run-name domain_adapt_31_to_32_strong_ewc
+        --run-name domain_adapt_31_to_32_strong_ewc \
+        --patience 10
 """
 
 import os
@@ -356,6 +357,15 @@ def main():
 
     device = args.device
     print(f"Device: {device}\n")
+    
+    # ── Setup run directory ────────────────────────────────────────────────
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = f"{args.run_name}" if args.run_name else f"adapt_{timestamp}"
+    
+    run_dir = os.path.join(config.CHECKPOINT_DIR, run_id)
+    models_dir = os.path.join(run_dir, "models")
+    os.makedirs(models_dir, exist_ok=True)
 
     # ── Load source model ─────────────────────────────────────────────────
     print(f"Loading checkpoint: {args.checkpoint}")
@@ -435,13 +445,7 @@ def main():
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     
     # ── Initialize history ────────────────────────────────────────────────
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_id = f"{args.run_name}" if args.run_name else f"adapt_{timestamp}"
-    
-    run_dir = os.path.join(config.CHECKPOINT_DIR, run_id)
-    models_dir = os.path.join(run_dir, "models")
-    os.makedirs(models_dir, exist_ok=True)
-    
+        
     history = {
         "run_id": run_id,
         "source_scenario": src_metadata["source_scenario"],
@@ -467,10 +471,10 @@ def main():
     
     patience = args.patience
     no_improve_epochs = 0
-    
+    patience_skip = False
     for epoch in range(1, args.epochs + 1):
         # Progressive unfreezing: unfreeze MSM at halfway point
-        if args.strategy == "progressive" and epoch == args.epochs // 2:
+        if args.strategy == "progressive" and epoch == args.epochs // 2 and not patience_skip:
             print(f"\n[Epoch {epoch}] Unfreezing MSM layer for progressive adaptation...")
             for param in model.msm.parameters():
                 param.requires_grad = True
@@ -506,6 +510,7 @@ def main():
         
         # Save best checkpoint
         if val_metrics["top3"] > best_val_top3:
+            no_improve_epochs = 0
             best_val_top3 = val_metrics["top3"]
             best_ckpt = os.path.join(models_dir, "best.pt")
             torch.save({
@@ -522,8 +527,17 @@ def main():
         else:
             no_improve_epochs += 1
             print(f"  No improvement for {no_improve_epochs} epoch(s)")
+        
+        if no_improve_epochs >= patience and epoch < args.epochs // 2:
+            patience_skip = True
+            no_improve_epochs = 0
             
-        if no_improve_epochs >= patience:
+            print(f"\n[Epoch {epoch}] Unfreezing MSM layer for progressive adaptation...")
+            for param in model.msm.parameters():
+                param.requires_grad = True
+            print_trainable_params(model)
+            
+        elif no_improve_epochs >= patience and epoch >= args.epochs // 2:
             print(f"Early stopping triggered after {patience} epochs without improvement.")
             break
     
