@@ -22,12 +22,6 @@ modalities to activate.  Rules per modality:
 Any modality whose conditions are not fully met is silently skipped, so
 the same code works unchanged across all DeepSense 6G scenarios regardless
 of which sensors were active during collection.
-
-DeepSense 6G scenarios that include each modality (as of 2024):
-  Image : Scenarios 1–9  (all)
-  GPS   : Scenarios 1–9  (all)
-  LiDAR : Scenario 9
-  Radar : Scenarios 8, 9
 """
 
 import os

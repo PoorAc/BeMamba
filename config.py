@@ -63,13 +63,6 @@ SCHEDULER_T_MULT = 2
 CHECKPOINT_DIR = "checkpoints"
 BEST_CKPT      = os.path.join(CHECKPOINT_DIR, "bemamba_best.pt")
 
-# ── Attack ─────────────────────────────────────────────────────────────────────
-# FGSM / PGD settings (applied to image modality)
-ATK_EPS        = 8 / 255    # L-inf perturbation budget
-ATK_ALPHA      = 2 / 255    # PGD step size
-ATK_STEPS      = 10         # PGD iterations
-ATK_RANDOM_START = True     # PGD: start from a random point within epsilon ball
-
 # Modality-dropout attack: fraction of modality tokens to zero out in MSM
 MODAL_DROP_FRAC = 0.5
 

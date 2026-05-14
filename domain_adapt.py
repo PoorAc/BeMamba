@@ -4,7 +4,7 @@ domain_adapt.py
 Domain adaptation and cross-scenario fine-tuning for BeMamba.
 
 Supports three adaptation strategies:
-  1. Full fine-tune: train all layers on new domain
+  1. Full fine-tune: train all layers on new domain. Basically implements train.py but with a pre-trained checkpoint and new data.
   2. Adapter-only: freeze extractors, fine-tune adapter + classifier
   3. Progressive: gradually unfreeze layers as training progresses
 
