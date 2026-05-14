@@ -9,9 +9,13 @@ Usage:
 
 import os
 import json
+import random
+import numpy as np
+from sched import scheduler
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+import argparse
 from tqdm import tqdm
 from datetime import datetime
 import matplotlib.pyplot as plt
@@ -19,11 +23,25 @@ import matplotlib.pyplot as plt
 from config import (
     CSV_FILE, NUM_BEAMS, D_MODEL, D_STATE, D_CONV, EXPAND, NUM_LAYERS,
     BATCH_SIZE, EPOCHS, LR, WEIGHT_DECAY, TOP_K, CHECKPOINT_DIR,
-    DEVICE, DATASET_ROOT,
+    MODALITY_DROPOUT, SCHEDULER_T0, SCHEDULER_T_MULT,
+    DEVICE, DATASET_ROOT, SEED,
 )
 from dataset import build_datasets
 from models import BeMamba
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Set random seeds for reproducibility
+# ─────────────────────────────────────────────────────────────────────────────
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    # For reproducibility (can reduce performance slightly)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Visualization utilities
@@ -146,21 +164,46 @@ def to_device(batch: dict) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # One training epoch
 # ─────────────────────────────────────────────────────────────────────────────
+def apply_modality_dropout(batch, active_modalities, p):
+    """
+    Independently drops each modality with probability p.
+    """
+    if p <= 0:
+        return batch
 
-def train_epoch(model, loader, optimizer, criterion):
+    for mod in active_modalities:
+        if mod in batch and torch.rand(1).item() < p:
+            batch[mod] = torch.zeros_like(batch[mod])
+
+    return batch
+
+def train_epoch(model, loader, optimizer, criterion, scheduler, scaler, epoch):
     model.train()
     total_loss = total_acc = 0.0
 
-    for batch in tqdm(loader, desc="  train", leave=False):
+    for batch_idx, batch in enumerate(tqdm(loader, desc="  train", leave=False)):
         batch  = to_device(batch)
         labels = batch["label"]
+        
+        # Apply modality dropout to the input batch before feeding it to the model
+        batch = apply_modality_dropout(batch, model.active, MODALITY_DROPOUT)
 
         optimizer.zero_grad()
-        logits = model(batch)
-        loss   = criterion(logits, labels)
-        loss.backward()
+
+        with torch.amp.autocast("cuda", enabled=(DEVICE == "cuda")):
+            logits = model(batch)
+            loss   = criterion(logits, labels)
+
+        scaler.scale(loss).backward()
+
+        # Unscale before clipping
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+
+        scaler.step(optimizer)
+        scaler.update()
+
+        scheduler.step(epoch + batch_idx / len(loader))
 
         total_loss += loss.item()
         total_acc  += topk_accuracy(logits.detach(), labels, 1)
@@ -176,31 +219,54 @@ def train_epoch(model, loader, optimizer, criterion):
 @torch.no_grad()
 def evaluate(model, loader) -> dict:
     model.eval()
-    all_logits, all_labels = [], []
+
+    correct = {k: 0 for k in TOP_K}
+    total = 0
 
     for batch in tqdm(loader, desc="  eval ", leave=False):
-        batch  = to_device(batch)
+        batch = to_device(batch)
         logits = model(batch)
-        all_logits.append(logits.cpu())
-        all_labels.append(batch["label"].cpu())
+        labels = batch["label"]
 
-    all_logits = torch.cat(all_logits)
-    all_labels = torch.cat(all_labels)
+        for k in TOP_K:
+            topk = logits.topk(k, dim=1)[1]
+            correct[k] += (topk == labels.unsqueeze(1)).any(dim=1).sum().item()
 
-    return {f"top{k}": topk_accuracy(all_logits, all_labels, k) for k in TOP_K}
+        total += labels.size(0)
 
+    return {f"top{k}": correct[k] / total for k in TOP_K}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# File utilites
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train a new BeMamba model on a dataset scenario.")
+    parser.add_argument("--run-name", help="Name of the training run", default=None)
+    parser.add_argument("--patience", type=int, default=10, help="Number of epochs with no improvement to wait before early stopping")
+    return parser.parse_args()
+        
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
+    
+    set_seed(SEED)
     print(f"Device: {DEVICE}\n")
+    
+    args = parse_args()
 
     # ── Setup run metadata ─────────────────────────────────────────────────
     scenario_name = os.path.basename(DATASET_ROOT)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_id = f"{scenario_name}_{timestamp}"
+    run_id = args.run_name if args.run_name else f"{scenario_name}_{timestamp}"
 
     # Create run-specific directories
     run_dir = os.path.join(CHECKPOINT_DIR, run_id)
@@ -217,6 +283,10 @@ def main():
             "epochs": EPOCHS,
             "lr": LR,
             "weight_decay": WEIGHT_DECAY,
+            "modality_dropout": MODALITY_DROPOUT,
+            "scheduler": "CosineAnnealingWarmRestarts",
+            "scheduler_t0": SCHEDULER_T0,
+            "scheduler_t_mult": SCHEDULER_T_MULT,
             "d_model": D_MODEL,
             "d_state": D_STATE,
             "d_conv": D_CONV,
@@ -235,18 +305,51 @@ def main():
     training_history["hyperparameters"]["seq_len"] = train_ds.seq_len
     training_history["modalities"] = modalities
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
-                              num_workers=4, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,
-                              num_workers=4, pin_memory=True)
-    test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False,
-                              num_workers=4, pin_memory=True)
+    num_workers = 2
+    pin_memory = False
+        
+    g = torch.Generator()
+    g.manual_seed(SEED)
+        
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=False,
+        worker_init_fn=seed_worker,
+        generator=g
+    )
+
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=False,
+        worker_init_fn=seed_worker,
+        generator=g
+    )
+
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=False,
+        worker_init_fn=seed_worker,
+        generator=g
+    )
 
     # ── Model ─────────────────────────────────────────────────────────────
     model = BeMamba(
         modalities=modalities,
-        d_model=D_MODEL, d_state=D_STATE, d_conv=D_CONV,
-        expand=EXPAND, num_layers=NUM_LAYERS, num_beams=NUM_BEAMS,
+        d_model=D_MODEL,
+        num_beams=NUM_BEAMS,
+        use_adapters=False,
     ).to(DEVICE)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -256,19 +359,31 @@ def main():
     training_history["hyperparameters"]["num_params"] = n_params
 
     # ── Optimiser & schedule ──────────────────────────────────────────────
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR,
-                                   weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    trainable_params = [
+        p for name, p in model.named_parameters()
+        if p.requires_grad and "adapter" not in name.lower()
+    ]
+
+    optimizer = torch.optim.AdamW(trainable_params, lr=LR,
+                                weight_decay=WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=SCHEDULER_T0, T_mult=SCHEDULER_T_MULT)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    scaler = torch.amp.GradScaler("cuda", enabled=(DEVICE == "cuda"))
 
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     best_top3 = 0.0
-
+    
     # ── Training loop ─────────────────────────────────────────────────────
+    
+    patience = args.patience
+    no_improve_epochs = 0
+    
     for epoch in range(1, EPOCHS + 1):
-        train_loss, train_top1 = train_epoch(model, train_loader, optimizer, criterion)
+        train_loss, train_top1 = train_epoch(
+                model, train_loader, optimizer, criterion, scheduler, scaler, epoch
+            )
         val_m = evaluate(model, val_loader)
-        scheduler.step()
 
         # Record epoch metrics (only loss and accuracies, no model saving per epoch)
         epoch_data = {
@@ -292,10 +407,13 @@ def main():
 
         # Save best model (only when validation improves)
         if val_m["top3"] > best_top3:
+            no_improve_epochs = 0
             best_top3 = val_m["top3"]
             best_ckpt_path = os.path.join(models_dir, "best.pt")
             torch.save({
                 "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict(),
                 "modalities": modalities,
                 "epoch": epoch,
                 "run_id": run_id,
@@ -304,11 +422,20 @@ def main():
                 "best_val_top3": best_top3
             }, best_ckpt_path)
             print(f"  ✓ Saved best checkpoint (top-3={best_top3:.4f})")
+        else:
+            no_improve_epochs += 1
+            print(f"  ✗ No improvement for {no_improve_epochs} epoch(s)")
+        
+        if no_improve_epochs >= patience:
+            print(f"\nEarly stopping triggered after {patience} epochs without improvement.")
+            break
 
     # Save final model
     final_ckpt_path = os.path.join(models_dir, "final.pt")
     torch.save({
         "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict(),
         "modalities": modalities,
         "epoch": EPOCHS,
         "run_id": run_id,

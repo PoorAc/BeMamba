@@ -43,12 +43,20 @@ from config import (
     IMAGE_DIR, LIDAR_DIR, RADAR_DIR,
     SEQ_LEN, VAL_RATIO, TEST_RATIO, SEED,
     NUM_BEAMS,
+    GPS_NOISE_STD, RADAR_NOISE_STD,
     LIDAR_VOXEL_H, LIDAR_VOXEL_W, LIDAR_VOXEL_D,
     RADAR_H, RADAR_W,
 )
 
 # ── Image pre-processing (ImageNet normalisation) ─────────────────────────────
-IMG_TRANSFORM = transforms.Compose([
+IMG_TRAIN_TRANSFORM = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225]),
+])
+
+IMG_EVAL_TRANSFORM = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406],
@@ -279,6 +287,7 @@ class DeepSense6GDataset(Dataset):
         self.norm_stats = norm_stats
         self.seq_len    = seq_len
         self.split      = split
+        self.is_train   = split == "train"
         self.csv_path   = csv_path
 
         df = pd.read_csv(csv_path)
@@ -347,12 +356,13 @@ class DeepSense6GDataset(Dataset):
 
     def _load_image_seq(self, window) -> torch.Tensor:
         imgs = []
+        transform = IMG_TRAIN_TRANSFORM if self.is_train else IMG_EVAL_TRANSFORM
 
         for _, row in window.iterrows():
             path = os.path.join(IMAGE_DIR, str(row[self._img_col]))
             img  = Image.open(path).convert("RGB") if os.path.exists(path) \
                    else Image.new("RGB", (224, 224))
-            imgs.append(IMG_TRANSFORM(img))
+            imgs.append(transform(img))
         return torch.stack(imgs)   # (T, 3, 224, 224)
 
     def _load_gps_seq(self, window) -> torch.Tensor:
@@ -368,6 +378,10 @@ class DeepSense6GDataset(Dataset):
             gps = np.stack(coords, axis=0)
         else:
             gps = np.zeros((len(window), 2), dtype=np.float32)
+
+        # Disable noise injection during base training (enable only for cross-inference robustness)
+        # if self.is_train and GPS_NOISE_STD > 0:
+        #     gps += np.random.normal(0, GPS_NOISE_STD, size=gps.shape).astype(np.float32)
 
         mean = self.norm_stats["gps_mean"]
         std  = self.norm_stats["gps_std"]
@@ -387,6 +401,12 @@ class DeepSense6GDataset(Dataset):
             path = os.path.join(RADAR_DIR, str(row[self._radar_col]))
             maps.append(_load_radar_file(path))
         arr = np.stack(maps)   # (T, 1, H, W)
+
+        # Disable noise injection during base training (enable only for cross-inference robustness)
+        # if self.is_train and RADAR_NOISE_STD > 0:
+        #     arr = arr + np.random.normal(0, RADAR_NOISE_STD, size=arr.shape).astype(np.float32)
+        #     arr = np.clip(arr, 0.0, 1.0)
+
         return torch.tensor(arr, dtype=torch.float32)
 
     # ── Dataset interface ─────────────────────────────────────────────────
