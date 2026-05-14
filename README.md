@@ -1,170 +1,143 @@
-# BeMamba v2 — Modular Implementation
+# Cross-Scenario BeMamba
 
-**Paper:** BeMamba: Efficient Multimodal Sensing-Aided Beamforming via State Space Model  
-**Dataset:** DeepSense 6G — https://www.deepsense6g.net
+BeMamba is a deep learning framework for multimodal beamforming in wireless communication systems, specifically designed for the DeepSense 6G dataset. It leverages State Space Models (SSMs) implemented via Mamba blocks to efficiently process temporal sequences from multiple sensing modalities, including images, GPS coordinates, LiDAR point clouds, and radar data. The model supports domain adaptation strategies to handle cross-scenario fine-tuning and includes features like Elastic Weight Consolidation (EWC) for preventing catastrophic forgetting.
 
----
+## Features
 
-## File Structure
+- **Multimodal Fusion**: Automatically detects and integrates available modalities (image, GPS, LiDAR, radar) from the dataset.
+- **Temporal Modeling**: Uses Time Sequence Mamba (TSM) for intra-modal temporal fusion and Modal Sequence Mamba (MSM) for cross-modal fusion.
+- **Domain Adaptation**: Supports strategies like full fine-tuning, adapter-only training, and progressive unfreezing, with optional EWC regularization.
+- **Efficient Architecture**: Lightweight Mamba-based SSMs for linear-time sequence processing.
+- **Evaluation Tools**: Includes scripts for training, domain adaptation, and cross-inference evaluation.
+- **Modality Dropout**: Built-in support for robustness training via modality dropout.
 
+## Requirements
+
+- **Python Version**: 3.10.11 (as specified in .python-version)
+- **Dependencies**: 
+  - PyTorch (with CUDA support for GPU acceleration)
+  - torchvision
+  - numpy
+  - pandas
+  - matplotlib
+  - tqdm
+  - scikit-learn
+  - PIL (Pillow)
+
+Install dependencies using pip:
+```bash
+pip install -r requirements.txt
 ```
-bemamba_v2/
-├── config.py        ← All hyperparameters and paths (edit this first)
-├── models.py        ← MambaBlock, TSM, MSM, all four extractors, BeMamba
-├── dataset.py       ← Auto-detecting dataset loader for all modalities
-├── train.py         ← Training + evaluation loop
-├── attack.py        ← Five adversarial attacks
-├── inference_example.py ← Example of loading and using trained models
-└── requirements.txt
-```
 
----
+## Installation
 
-## Modality Auto-Detection
+1. Clone or download the project repository.
+2. Ensure Python 3.10.11 is installed and set as the active version (use `pyenv` or similar if needed).
+3. Install the required packages as listed above.
+4. Place the project files in your working directory.
 
-The dataset loader inspects the CSV and filesystem automatically.
-No manual flags — just point it at the data.
+## Dataset
 
-| Modality | CSV signal | Directory needed |
-|----------|-----------|-----------------|
-| Image    | `unit1_rgb_*` columns | `unit1/camera_data/` |
-| GPS      | `unit2_gps_long` + `unit2_gps_lat` OR `unit2_loc*` columns | `unit2/GPS_data/` (for file-based) |
-| LiDAR    | `unit1_lidar_*` columns | `unit1/lidar_data/` |
-| Radar    | `unit1_radar_*`, `unit1_pwr_*`, or `mmwave*` columns | `unit1/mmWave_data/` or `unit1/radar/` |
+This project uses the DeepSense 6G dataset for training and evaluation. The dataset consists of multimodal sensing data collected in various driving scenarios for beamforming tasks.
 
-DeepSense 6G scenarios with each modality:
-- **Image + GPS:** Scenarios 1–9 (all)
-- **Radar:** Scenarios 5, 8 (stored as mmWave power files)
-- **LiDAR:** Scenario 8 (point clouds), Scenario 9 (SCR data)
+### Downloading the Dataset
+- Download the desired DeepSense 6G scenarios from the official website: [https://www.deepsense6g.net](https://www.deepsense6g.net).
+- Recommended scenarios: Scenario 8 or Scenario 9 for multi-modal data (including image, GPS, LiDAR, and radar).
 
----
+### Organizing the Dataset
+- Extract the downloaded scenarios into a folder named Scenarios in the project root directory.
+- Each scenario should be in its own subfolder (e.g., 31, 32, etc.).
+- Ensure the following structure for each scenario:
+  ```
+  Scenarios/
+  ├── <scenario_number>/
+  │   ├── <scenario_number>.csv  # CSV file with labels and file paths
+  │   ├── unit1/
+  │   │   ├── camera_data/       # Image files
+  │   │   ├── lidar_data/        # LiDAR files (.bin or .npy)
+  │   │   └── mmWave_data/       # Radar files (.txt or .npy)
+  ```
+- The dataset loader automatically detects available modalities based on the CSV file and directory existence.
 
-## Quick Start
+## Configuration
+
+Edit config.py to customize hyperparameters, paths, and settings:
+- Set `DATASET_ROOT` to the path of your scenario folder.
+- Adjust model parameters (e.g., `D_MODEL`, `NUM_LAYERS`), training settings (e.g., `BATCH_SIZE`, `EPOCHS`), and device (`DEVICE`).
+- For domain adaptation, configure EWC and strategy parameters.
+
+## Usage
+
+### Training a New Model
+
+Run train.py to train BeMamba on a specific scenario:
 
 ```bash
-# 1. Install dependencies
-pip install -r requirements.txt
-
-# 2. Download a scenario from https://www.deepsense6g.net
-#    and extract it. Edit config.py:
-#      DATASET_ROOT = "./scenario9"   (or whichever you downloaded)
-#      CSV_FILE     = "./scenario9/scenario9.csv"
-
-# 3. Train
-python train.py
-
-# 4. Run adversarial attacks (requires a trained checkpoint)
-python attack.py
+python train.py --run-name my_training_run --patience 10
 ```
 
----
+- `--run-name`: Optional name for the training run (defaults to timestamp-based).
+- `--patience`: Number of epochs to wait for improvement before early stopping.
+- Results, models, and plots are saved in `checkpoints/<run_name>/`.
 
-## Model Saving & Loading
+### Domain Adaptation
 
-Each training run creates a timestamped directory under `checkpoints/` with:
+Use domain_adapt.py to adapt a trained model to a new domain:
 
-```
-checkpoints/
-└── Scenario8_20231201_143022/          # scenario + timestamp
-    ├── models/
-    │   ├── best.pt                     # best validation accuracy
-    │   └── final.pt                    # final epoch
-    ├── training_metrics.png            # training curves visualization
-    ├── training_history.json           # full metrics per epoch
-    └── run_summary.json                # hyperparameters + final results
-```
-
-### Training Metrics Visualization
-
-The `training_metrics.png` file contains four subplots showing:
-- **Training Loss**: Loss curve over epochs
-- **Top-1 Accuracy**: Training and validation accuracy
-- **Top-3 & Top-5 Accuracy**: Validation accuracy for different k values
-- **Learning Rate**: Learning rate schedule (log scale)
-
-### Loading a Trained Model
-
-```python
-from train import load_model
-
-# Load the best model from a run
-model, metadata = load_model("checkpoints/Scenario8_20231201_143022/models/best.pt")
-
-print(f"Loaded {metadata['scenario']} model from epoch {metadata['epoch']}")
-print(f"Active modalities: {metadata['modalities']}")
+```bash
+python domain_adapt.py --checkpoint ./checkpoints/<source_run>/models/best.pt \
+    --source-csv ./Scenarios/31/31.csv \
+    --target-csv ./Scenarios/32/32.csv \
+    --strategy adapter-only \
+    --epochs 50 \
+    --use-ewc \
+    --ewc-lambda 1.0 \
+    --run-name domain_adapt_31_to_32
 ```
 
-See `inference_example.py` for a complete inference workflow.
+- `--checkpoint`: Path to the source model checkpoint.
+- `--source-csv` and `--target-csv`: Paths to source and target CSV files.
+- `--strategy`: Adaptation strategy (`full`, `adapter-only`, `progressive`).
+- `--use-ewc`: Enable Elastic Weight Consolidation.
+- Adapted models and metrics are saved in `checkpoints/<run_name>/`.
 
----
+### Cross-Inference Evaluation
 
-## Architecture
+Evaluate a trained model on a different dataset split or scenario using cross_infer.py:
 
-```
-Per active modality (T timesteps):
-  raw input → Modality Extractor → (B, T, d_model)
-                                        │
-                              TimeSequenceMamba (TSM)
-                              intra-modal temporal fusion
-                                        │
-                                   (B, d_model)
-                                        │
-                    ┌───────────────────┴──────────────────┐
-              image_feat          gps_feat        lidar_feat  radar_feat
-                                        │
-                              ModalSequenceMamba (MSM)
-                              cross-modal fusion
-                                        │
-                                   (B, d_model)
-                                        │
-                                   Classifier
-                                        │
-                               (B, NUM_BEAMS) logits
+```bash
+python cross_infer.py --checkpoint ./checkpoints/<run>/models/best.pt \
+    --csv ./Scenarios/32/32.csv \
+    --dataset-root ./Scenarios/32 \
+    --split test \
+    --batch-size 24
 ```
 
----
+- `--checkpoint`: Path to the model checkpoint.
+- `--csv`: Path to the evaluation CSV.
+- `--dataset-root`: Root folder of the evaluation dataset.
+- `--split`: Dataset split to evaluate (`train`, `val`, `test`).
+- Results are saved in `cross_inference/<run>_<dataset>/`.
 
-## Adversarial Attacks (`attack.py`)
+## File Overview
 
-| # | Attack | Modality | Threat Model | Description |
-|---|--------|----------|-------------|-------------|
-| 1 | **FGSM** | Image | White-box | Single-step L∞ gradient sign attack |
-| 2 | **PGD** | Image | White-box | Iterative projected gradient descent (Madry et al.) |
-| 3 | **ModalDrop** | Any | Black-box physical | Zero out one full sensor modality |
-| 4 | **GPSSpoof** | GPS | White-box | Adversarial shift of GPS coordinates (FGSM on GPS) |
-| 5 | **FeatureNoise** | LiDAR / Radar | Grey-box | Gaussian noise injected into feature vectors post-extraction |
+- **.python-version**: Specifies Python version 3.10.
+- **config.py**: Central configuration file for paths, hyperparameters, and settings.
+- **dataset.py**: Dataset loading and preprocessing utilities, including modality detection and data augmentation.
+- **models.py**: Model definitions, including BeMamba, Mamba blocks, and modality-specific extractors.
+- **train.py**: Script for training BeMamba on a dataset scenario.
+- **domain_adapt.py**: Script for domain adaptation and cross-scenario fine-tuning.
+- **cross_infer.py**: Script for evaluating a model on different datasets or splits.
 
-### Example output
+## Notes
 
-```
-══════════════════════════════════════════════════════════════
-Attack                   top1      top3      top5
-──────────────────────────────────────────────────────────────
-Clean                  0.6480    0.8380    0.8990
-FGSM                   0.4210    0.6930    0.7840  ▼0.2270
-PGD                    0.2830    0.5410    0.6720  ▼0.3650
-Drop-image             0.5120    0.7650    0.8430  ▼0.1360
-Drop-gps               0.5870    0.8010    0.8680  ▼0.0610
-Drop-lidar             0.6290    0.8210    0.8870  ▼0.0190
-Drop-radar             0.6350    0.8290    0.8940  ▼0.0130
-GPS-Spoof              0.5340    0.7730    0.8510  ▼0.1140
-FeatNoise-lidar        0.5920    0.8050    0.8710  ▼0.0560
-FeatNoise-radar        0.6140    0.8190    0.8860  ▼0.0340
-══════════════════════════════════════════════════════════════
-```
+- Ensure GPU availability if using CUDA (set `DEVICE = "cuda"` in config.py).
+- The code uses automatic mixed precision (AMP) for faster training on compatible hardware.
+- For reproducibility, random seeds are set based on `SEED` in config.py.
+- Modality dropout and noise injection can be enabled in config.py for robustness experiments.
 
----
+## License
 
-## Key Hyperparameters (`config.py`)
+This project is provided as-is for research purposes. Please refer to the DeepSense 6G dataset license for data usage terms.
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `SEQ_LEN` | 5 | Temporal window length |
-| `D_MODEL` | 128 | Mamba hidden dimension |
-| `D_STATE` | 16 | SSM state size |
-| `EXPAND` | 2 | Inner-dim expansion factor |
-| `NUM_LAYERS` | 2 | Stacked Mamba blocks |
-| `ATK_EPS` | 8/255 | FGSM / PGD L∞ budget |
-| `ATK_STEPS` | 10 | PGD iterations |
-| `LIDAR_VOXEL_D/H/W` | 16/32/32 | LiDAR voxel grid shape |
-| `RADAR_H/W` | 64/64 | Radar map spatial size |
+For questions or issues, refer to the code comments or raise an issue in the repository.
